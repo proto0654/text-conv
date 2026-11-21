@@ -176,7 +176,7 @@ def set_clip(data, timeout=1.5):
     write_clip(want)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        time.sleep(0.03)
+        time.sleep(0.01)  # мельче шаг — раньше ловим владение (wl-copy ~30 мс)
         if read_clip() == want:
             return True
     log("clip not confirmed: %r" % (want[:40],))
@@ -193,10 +193,21 @@ def send_chord(key, terminal=False, shift=False):
         args += ["-m", "shift"]
     args += ["-m", "ctrl"]
     r = run(args, timeout=6)
-    dbg(
-        "wtype %r rc=%s err=%r focus=%r"
-        % (args[1:], getattr(r, "returncode", None), (getattr(r, "stderr", b"") or b"")[:120], active_window().get("class"))
-    )
+    if DEBUG:  # active_window() — это ещё один вызов hyprctl, не дёргаем зря
+        dbg(
+            "wtype %r rc=%s err=%r focus=%r"
+            % (args[1:], getattr(r, "returncode", None), (getattr(r, "stderr", b"") or b"")[:120], active_window().get("class"))
+        )
+
+
+def release_modifiers():
+    """Снять модификаторы хоткея синтетически, вместо ожидания.
+
+    Если Shift ещё зажат, Ctrl+C уйдёт как Ctrl+Shift+C (в Chrome это
+    «inspect element»). Ждать 0,35 с, пока палец отпустит клавишу, дорого;
+    wtype умеет послать key-release сам — состояние снимается сразу.
+    """
+    run(["wtype", "-m", "shift", "-m", "ctrl", "-m", "alt", "-m", "logo"], timeout=3)
 
 
 def select_word_left():
@@ -276,9 +287,11 @@ def do_convert(mode):
     original = read_clip() or b""
     sentinel = ("__TEXT_CONV_%d__" % os.getpid()).encode()
 
-    # даём отпустить модификатор хоткея: если Shift ещё зажат, Ctrl+C уйдёт в
-    # приложение как Ctrl+Shift+C (в Chrome это «inspect element» -> DevTools)
-    time.sleep(0.35)
+    # модификатор хоткея: если Shift ещё зажат, Ctrl+C уйдёт в приложение как
+    # Ctrl+Shift+C (в Chrome это «inspect element»). Ждём чуть-чуть, а остаток
+    # снимаем синтетическим key-release — это дешевле, чем спать 0,35 с
+    time.sleep(0.08)
+    release_modifiers()
 
     # 1. помечаем буфер, чтобы отличить «ничего не выделено» от «текст совпал»
     if not set_clip(sentinel):
@@ -288,11 +301,12 @@ def do_convert(mode):
 
     pasted = None
 
-    def grab(timeout_steps=20):
+    def grab(timeout_steps=25):
         for _ in range(timeout_steps):
-            time.sleep(0.05)
+            time.sleep(0.02)  # приложение отвечает на Ctrl+C за ~10-30 мс
             got = read_clip()
-            dbg("poll: %r" % (got[:40] if got else got,))
+            if DEBUG:
+                dbg("poll: %r" % (got[:40] if got else got,))
             if got is not None and got != sentinel:
                 return got
         return None
@@ -300,10 +314,10 @@ def do_convert(mode):
     # 1) обычное копирование в буфер обмена
     pasted = grab()
 
-    # 1b) вторая попытка: модификатор хоткея мог держаться ещё в момент первой
+    # 1b) вторая попытка: копирование могло не сработать с первого раза
     if pasted is None:
         dbg("retry copy")
-        time.sleep(0.3)
+        time.sleep(0.15)
         if set_clip(sentinel):
             send_chord("c", terminal=terminal)
             pasted = grab()
