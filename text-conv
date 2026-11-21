@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Правка выделенного текста в Hyprland/Wayland.
+
+Режимы:
+  layout   сменить раскладку выделенного: латиница -> кириллица или наоборот
+           (направление определяется по преобладающим буквам)
+  case     инвертировать регистр выделенного (Привет -> пРИВЕТ)
+
+  --stdin  не трогать буфер обмена, читать текст из stdin и печатать результат
+           (для отладки и тестов)
+
+Как работает без автодетекта: берём активное окно, кладём в буфер уникальную
+метку, жмём «копировать» (Ctrl+C, а в терминалах Ctrl+Shift+C), ждём, пока в
+буфере появится выделенный текст. Метка на месте = ничего не выделено.
+Дальше кладём в буфер результат и жмём «вставить», после чего возвращаем
+прежнее содержимое буфера обмена.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+# --- таблицы раскладок -------------------------------------------------------
+
+EN = "qwertyuiop[]" + "asdfghjkl;'" + "zxcvbnm,./" + "`"
+RU = "йцукенгшщзхъ" + "фывапролджэ" + "ячсмитьбю." + "ё"
+
+# символы, живущие на тех же клавишах с Shift
+SHIFT_PAIRS = {
+    "~": "Ё", "{": "Х", "}": "Ъ", ":": "Ж", '"': "Э", "<": "Б",
+    ">": "Ю", "?": ",", "|": "/", "@": '"', "#": "№", "$": ";",
+    "^": ":", "&": "?", "[": "х", "]": "ъ",
+}
+
+
+def _tables():
+    en_ru, ru_en = {}, {}
+    for e, r in zip(EN, RU):
+        en_ru[e] = r
+        ru_en[r] = e
+        if e.upper() != e:  # только буквы: у пунктуации .upper() не меняет символ
+            en_ru[e.upper()] = r.upper()
+            ru_en[r.upper()] = e.upper()
+    for k, v in SHIFT_PAIRS.items():
+        en_ru.setdefault(k, v)
+        ru_en.setdefault(v, k)
+    return en_ru, ru_en
+
+
+EN_RU, RU_EN = _tables()
+
+TERMINAL_HINTS = (
+    "alacritty", "foot", "kitty", "ghostty", "wezterm",
+    "konsole", "xterm", "urxvt", "tilix", "term",
+)
+
+LOG = "/tmp/text-conv.log"
+
+
+def log(msg):
+    try:
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 200_000:
+            os.replace(LOG, LOG + ".1")
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (time.strftime("%H:%M:%S"), msg))
+    except OSError:
+        pass
+
+
+DEBUG = bool(os.environ.get("TEXT_CONV_DEBUG"))
+
+
+def dbg(msg):
+    if DEBUG:
+        log(msg)
+
+
+def run(cmd, data=None, timeout=6, quiet=False):
+    out = subprocess.DEVNULL if quiet else subprocess.PIPE
+    try:
+        return subprocess.run(
+            cmd, input=data, stdout=out, stderr=out, timeout=timeout
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        log("fail %s: %r" % (cmd, exc))
+        return None
+
+
+def notify(msg):
+    run(["notify-send", "-a", "text-conv", "-t", "2500", "Текст", msg])
+
+
+# --- преобразования ----------------------------------------------------------
+
+def has_letter(text):
+    return any(c.isalpha() for c in text)
+
+
+def convert_layout(text):
+    latin = sum(1 for c in text if ("a" <= c.lower() <= "z"))
+    cyr = sum(1 for c in text if ("а" <= c.lower() <= "я") or c.lower() in "ёіїє")
+    table = EN_RU if latin >= cyr else RU_EN
+    direction = "en->ru" if latin >= cyr else "ru->en"
+
+    out = []
+    last = len(text) - 1
+    for i, c in enumerate(text):
+        mapped = table.get(c)
+        if mapped is None:
+            out.append(c)
+            continue
+        if c.isalpha() and mapped.isalpha():
+            out.append(mapped)
+            continue
+        # одна из сторон — пунктуация: меняем, только если символ стоит внутри
+        # слова (ghbdtn,rfr -> приветбкак), иначе это настоящий знак препинания
+        left = text[i - 1] if i else ""
+        right = text[i + 1] if i < last else ""
+        out.append(mapped if (left.isalpha() and right.isalpha()) else c)
+    return "".join(out), direction
+
+
+def convert_case(text):
+    return text.swapcase()
+
+
+def transform(text, mode):
+    if mode == "layout":
+        if not has_letter(text):
+            return None, "нет букв"
+        out, direction = convert_layout(text)
+        if out == text:
+            return None, "нечего менять (%s)" % direction
+        return out, direction
+    if mode == "case":
+        if not text:
+            return None, "пусто"
+        out = convert_case(text)
+        if out == text:
+            return None, "регистр менять не нужно"
+        return out, "case"
+    raise SystemExit("неизвестный режим: %s" % mode)
+
+
+# --- работа с буфером обмена -------------------------------------------------
+
+def active_window():
+    r = run(["hyprctl", "activewindow", "-j"])
+    if not r or r.returncode != 0:
+        return {}
+    try:
+        return json.loads(r.stdout or b"{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+def read_clip():
+    r = run(["wl-paste", "-n"], timeout=5)
+    if not r or r.returncode != 0:
+        return None
+    return r.stdout
+
+
+def read_primary():
+    r = run(["wl-paste", "-p", "-n"], timeout=5)
+    if not r or r.returncode != 0:
+        return None
+    return r.stdout or None
+
+
+def write_clip(data):
+    if not isinstance(data, bytes):
+        data = data.encode("utf-8")
+    # тихо: wl-copy форкает демона, который держит унаследованные пайпы открытыми
+    return run(["wl-copy"], data=data, timeout=6, quiet=True)
+
+
+def set_clip(data, timeout=1.5):
+    """Кладём данные в буфер и ждём, пока wl-copy реально станет владельцем.
+
+    wl-copy форкает демона, который берёт владение асинхронно: если отправить
+    Ctrl+C сразу, копирование приложения проиграет гонку и буфер останется
+    с нашим содержимым (или наоборот — с чужим).
+    """
+    want = data if isinstance(data, bytes) else data.encode("utf-8")
+    write_clip(want)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.03)
+        if read_clip() == want:
+            return True
+    log("clip not confirmed: %r" % (want[:40],))
+    return False
+
+
+def send_chord(key, terminal=False, shift=False):
+    need_shift = shift or terminal
+    args = ["wtype", "-M", "ctrl"]
+    if need_shift:
+        args += ["-M", "shift"]
+    args += ["-k", key]
+    if need_shift:
+        args += ["-m", "shift"]
+    args += ["-m", "ctrl"]
+    r = run(args, timeout=6)
+    dbg(
+        "wtype %r rc=%s err=%r focus=%r"
+        % (args[1:], getattr(r, "returncode", None), (getattr(r, "stderr", b"") or b"")[:120], active_window().get("class"))
+    )
+
+
+def select_word_left():
+    """Ctrl+Shift+Left — выделить слово слева от курсора."""
+    r = run(
+        ["wtype", "-M", "ctrl", "-M", "shift", "-k", "Left", "-m", "shift", "-m", "ctrl"],
+        timeout=6,
+    )
+    dbg("select-word-left rc=%s" % getattr(r, "returncode", None))
+
+
+def switch_keyboard_layout(direction):
+    """Переключить системную раскладку на ту, в которую сконвертировали текст."""
+    target = "ru" if direction == "en->ru" else "us"
+    r = run(["hyprctl", "-j", "devices"])
+    if not r or r.returncode != 0:
+        return
+    try:
+        data = json.loads(r.stdout or b"{}")
+    except json.JSONDecodeError:
+        return
+    for kb in data.get("keyboards", []):
+        name = kb.get("name")
+        items = [x.strip() for x in (kb.get("layout") or "").split(",") if x.strip()]
+        if not name or target not in items:
+            continue
+        idx = items.index(target)
+        if kb.get("active_layout_index") == idx:
+            dbg("layout %s уже %s" % (name, target))
+            continue
+        run(["hyprctl", "switchxkblayout", name, str(idx)])
+        dbg("layout %s -> %s (%d)" % (name, target, idx))
+
+
+def main():
+    argv = [a for a in sys.argv[1:]]
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 1
+    mode = argv[0]
+    stdin_mode = "--stdin" in argv
+
+    if stdin_mode:
+        text = sys.stdin.read()
+        out, why = transform(text, mode)
+        if out is None:
+            log("stdin noop: %s" % why)
+            return 0
+        sys.stdout.write(out)
+        return 0
+
+    lock = "/tmp/text-conv.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        log("busy, skip")
+        return 0
+    try:
+        return do_convert(mode)
+    finally:
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+
+
+def do_convert(mode):
+    win = active_window()
+    klass = " ".join(
+        str(win.get(k) or "") for k in ("class", "initialClass")
+    ).lower()
+    terminal = any(h in klass for h in TERMINAL_HINTS)
+    log("mode=%s class=%r terminal=%s" % (mode, klass, terminal))
+
+    original = read_clip() or b""
+    sentinel = ("__TEXT_CONV_%d__" % os.getpid()).encode()
+
+    # даём отпустить модификатор хоткея: если Shift ещё зажат, Ctrl+C уйдёт в
+    # приложение как Ctrl+Shift+C (в Chrome это «inspect element» -> DevTools)
+    time.sleep(0.35)
+
+    # 1. помечаем буфер, чтобы отличить «ничего не выделено» от «текст совпал»
+    if not set_clip(sentinel):
+        notify("Буфер обмена занят, попробуйте ещё раз")
+        return 0
+    send_chord("c", terminal=terminal)
+
+    pasted = None
+
+    def grab(timeout_steps=20):
+        for _ in range(timeout_steps):
+            time.sleep(0.05)
+            got = read_clip()
+            dbg("poll: %r" % (got[:40] if got else got,))
+            if got is not None and got != sentinel:
+                return got
+        return None
+
+    # 1) обычное копирование в буфер обмена
+    pasted = grab()
+
+    # 1b) вторая попытка: модификатор хоткея мог держаться ещё в момент первой
+    if pasted is None:
+        dbg("retry copy")
+        time.sleep(0.3)
+        if set_clip(sentinel):
+            send_chord("c", terminal=terminal)
+            pasted = grab()
+
+    # 2) выделение мышью: Electron/Chromium отдаёт его в PRIMARY, а Ctrl+C иногда
+    #    не срабатывает, поэтому читаем первичное выделение напрямую
+    if pasted is None:
+        prim = read_primary()
+        if prim:
+            dbg("primary: %r" % (prim[:60],))
+            pasted = prim
+
+    # 3) ничего не выделено — берём слово слева от курсора
+    if pasted is None and not terminal:
+        dbg("no selection, selecting word to the left")
+        select_word_left()
+        time.sleep(0.12)
+        if set_clip(sentinel):
+            send_chord("c", terminal=terminal)
+            pasted = grab()
+
+    if pasted is None:
+        write_clip(original)
+        log("no selection (sentinel intact)")
+        notify("Ничего не выделено")
+        return 0
+
+    try:
+        text = pasted.decode("utf-8")
+    except UnicodeDecodeError:
+        write_clip(original)
+        notify("В буфере не текст")
+        return 0
+
+    out, why = transform(text, mode)
+    if out is None:
+        write_clip(original)
+        log("noop: %s | text=%r" % (why, text[:60]))
+        notify(why)
+        return 0
+
+    if not set_clip(out):
+        notify("Не удалось записать буфер обмена")
+        return 0
+    send_chord("v", terminal=terminal)
+    log("ok %s: %r -> %r" % (why, text[:60], out[:60]))
+
+    # раскладку системы ставим на тот язык, в который сконвертировали
+    if mode == "layout":
+        switch_keyboard_layout(why)
+
+    # возвращаем прежний буфер чуть позже, чтобы вставка успела прочитать
+    tmp = tempfile.NamedTemporaryFile(delete=False, prefix="text-conv-")
+    tmp.write(original)
+    tmp.close()
+    subprocess.Popen(
+        ["sh", "-c", 'sleep 1.5; wl-copy < "$1"; rm -f "$1"', "sh", tmp.name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
