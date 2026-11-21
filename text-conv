@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -S
 """Правка выделенного текста в Hyprland/Wayland.
 
 Режимы:
@@ -16,11 +16,9 @@
 прежнее содержимое буфера обмена.
 """
 
-import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 
 # --- таблицы раскладок -------------------------------------------------------
@@ -135,13 +133,17 @@ def transform(text, mode):
 # --- работа с буфером обмена -------------------------------------------------
 
 def active_window():
-    r = run(["hyprctl", "activewindow", "-j"])
+    """Классы активного окна одной строкой — без `-j`, чтобы не тянуть json
+    на старте (его импорт стоит ~10 мс из ~190 мс нажатия)."""
+    r = run(["hyprctl", "activewindow"])
     if not r or r.returncode != 0:
-        return {}
-    try:
-        return json.loads(r.stdout or b"{}")
-    except json.JSONDecodeError:
-        return {}
+        return ""
+    out = []
+    for line in (r.stdout or b"").decode("utf-8", "replace").splitlines():
+        key, _, val = line.strip().partition(":")
+        if key in ("class", "initialClass"):
+            out.append(val.strip().lower())
+    return " ".join(out)
 
 
 def read_clip():
@@ -176,16 +178,23 @@ def set_clip(data, timeout=1.5):
     write_clip(want)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        time.sleep(0.01)  # мельче шаг — раньше ловим владение (wl-copy ~30 мс)
+        time.sleep(0.004)  # мельче шаг — раньше ловим владение (wl-copy ~47 мс)
         if read_clip() == want:
             return True
     log("clip not confirmed: %r" % (want[:40],))
     return False
 
 
-def send_chord(key, terminal=False, shift=False):
+def send_chord(key, terminal=False, shift=False, release_mods=False):
+    """Ctrl+<key> через wtype. release_mods — сначала отпустить модификаторы
+    хоткея: если Shift ещё зажат, Ctrl+C уйдёт как Ctrl+Shift+C (в Chrome это
+    «inspect element»). Отдельный вызов wtype на отпускание стоил ещё 15 мс,
+    поэтому всё в одной команде."""
     need_shift = shift or terminal
-    args = ["wtype", "-M", "ctrl"]
+    args = ["wtype"]
+    if release_mods:
+        args += ["-m", "shift", "-m", "ctrl", "-m", "alt", "-m", "logo"]
+    args += ["-M", "ctrl"]
     if need_shift:
         args += ["-M", "shift"]
     args += ["-k", key]
@@ -196,18 +205,8 @@ def send_chord(key, terminal=False, shift=False):
     if DEBUG:  # active_window() — это ещё один вызов hyprctl, не дёргаем зря
         dbg(
             "wtype %r rc=%s err=%r focus=%r"
-            % (args[1:], getattr(r, "returncode", None), (getattr(r, "stderr", b"") or b"")[:120], active_window().get("class"))
+            % (args[1:], getattr(r, "returncode", None), (getattr(r, "stderr", b"") or b"")[:120], active_window())
         )
-
-
-def release_modifiers():
-    """Снять модификаторы хоткея синтетически, вместо ожидания.
-
-    Если Shift ещё зажат, Ctrl+C уйдёт как Ctrl+Shift+C (в Chrome это
-    «inspect element»). Ждать 0,35 с, пока палец отпустит клавишу, дорого;
-    wtype умеет послать key-release сам — состояние снимается сразу.
-    """
-    run(["wtype", "-m", "shift", "-m", "ctrl", "-m", "alt", "-m", "logo"], timeout=3)
 
 
 def select_word_left():
@@ -221,6 +220,8 @@ def select_word_left():
 
 def switch_keyboard_layout(direction):
     """Переключить системную раскладку на ту, в которую сконвертировали текст."""
+    import json  # лениво: вызов идёт уже после вставки, на старте не нужен
+
     target = "ru" if direction == "en->ru" else "us"
     r = run(["hyprctl", "-j", "devices"])
     if not r or r.returncode != 0:
@@ -277,33 +278,27 @@ def main():
 
 
 def do_convert(mode):
-    win = active_window()
-    klass = " ".join(
-        str(win.get(k) or "") for k in ("class", "initialClass")
-    ).lower()
+    klass = active_window()
     terminal = any(h in klass for h in TERMINAL_HINTS)
     log("mode=%s class=%r terminal=%s" % (mode, klass, terminal))
 
     original = read_clip() or b""
     sentinel = ("__TEXT_CONV_%d__" % os.getpid()).encode()
 
-    # модификатор хоткея: если Shift ещё зажат, Ctrl+C уйдёт в приложение как
-    # Ctrl+Shift+C (в Chrome это «inspect element»). Ждём чуть-чуть, а остаток
-    # снимаем синтетическим key-release — это дешевле, чем спать 0,35 с
-    time.sleep(0.08)
-    release_modifiers()
-
-    # 1. помечаем буфер, чтобы отличить «ничего не выделено» от «текст совпал»
+    # 1. помечаем буфер, чтобы отличить «ничего не выделено» от «текст совпал»,
+    #    и сразу копируем. Модификаторы хоткея отпускаются тем же вызовом wtype:
+    #    иначе при зажатом Shift Ctrl+C уходит как Ctrl+Shift+C (в Chrome это
+    #    «inspect element»)
     if not set_clip(sentinel):
         notify("Буфер обмена занят, попробуйте ещё раз")
         return 0
-    send_chord("c", terminal=terminal)
+    send_chord("c", terminal=terminal, release_mods=True)
 
     pasted = None
 
     def grab(timeout_steps=25):
         for _ in range(timeout_steps):
-            time.sleep(0.02)  # приложение отвечает на Ctrl+C за ~10-30 мс
+            time.sleep(0.008)  # приложение отвечает на Ctrl+C за ~10-30 мс
             got = read_clip()
             if DEBUG:
                 dbg("poll: %r" % (got[:40] if got else got,))
@@ -319,7 +314,7 @@ def do_convert(mode):
         dbg("retry copy")
         time.sleep(0.15)
         if set_clip(sentinel):
-            send_chord("c", terminal=terminal)
+            send_chord("c", terminal=terminal, release_mods=True)
             pasted = grab()
 
     # 2) выделение мышью: Electron/Chromium отдаёт его в PRIMARY, а Ctrl+C иногда
@@ -370,11 +365,11 @@ def do_convert(mode):
         switch_keyboard_layout(why)
 
     # возвращаем прежний буфер чуть позже, чтобы вставка успела прочитать
-    tmp = tempfile.NamedTemporaryFile(delete=False, prefix="text-conv-")
-    tmp.write(original)
-    tmp.close()
+    backup = "/tmp/text-conv-restore-%d" % os.getpid()
+    with open(backup, "wb") as f:
+        f.write(original)
     subprocess.Popen(
-        ["sh", "-c", 'sleep 1.5; wl-copy < "$1"; rm -f "$1"', "sh", tmp.name],
+        ["sh", "-c", 'sleep 1.5; wl-copy < "$1"; rm -f "$1"', "sh", backup],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
