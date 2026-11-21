@@ -52,6 +52,10 @@ def _tables():
 
 EN_RU, RU_EN = _tables()
 
+# str.translate — цикл на C: одна таблица на направление, ~2x быстрее
+# "".join(dict.get(c, c) for c in text) и без лямбд, как в re.sub
+TRANS = {"en->ru": str.maketrans(EN_RU), "ru->en": str.maketrans(RU_EN)}
+
 TERMINAL_HINTS = (
     "alacritty", "foot", "kitty", "ghostty", "wezterm",
     "konsole", "xterm", "urxvt", "tilix", "term",
@@ -95,32 +99,17 @@ def notify(msg):
 
 # --- преобразования ----------------------------------------------------------
 
-def has_letter(text):
-    return any(c.isalpha() for c in text)
-
-
 def convert_layout(text):
+    """Каждый символ меняется на тот, что стоит на этой же клавише в другой
+    раскладке (`]` ~ `ъ`, `.` ~ `ю`, `/` ~ `.`, `?` ~ `,`, `"` ~ `Э`).
+
+    Никаких исключений по месту в слове: переключение раскладки — это
+    переотображение клавиш, поэтому правило одно и предсказуемое.
+    """
     latin = sum(1 for c in text if ("a" <= c.lower() <= "z"))
     cyr = sum(1 for c in text if ("а" <= c.lower() <= "я") or c.lower() in "ёіїє")
-    table = EN_RU if latin >= cyr else RU_EN
     direction = "en->ru" if latin >= cyr else "ru->en"
-
-    out = []
-    last = len(text) - 1
-    for i, c in enumerate(text):
-        mapped = table.get(c)
-        if mapped is None:
-            out.append(c)
-            continue
-        if c.isalpha() and mapped.isalpha():
-            out.append(mapped)
-            continue
-        # одна из сторон — пунктуация: меняем, только если символ стоит внутри
-        # слова (ghbdtn,rfr -> приветбкак), иначе это настоящий знак препинания
-        left = text[i - 1] if i else ""
-        right = text[i + 1] if i < last else ""
-        out.append(mapped if (left.isalpha() and right.isalpha()) else c)
-    return "".join(out), direction
+    return text.translate(TRANS[direction]), direction
 
 
 def convert_case(text):
@@ -129,8 +118,6 @@ def convert_case(text):
 
 def transform(text, mode):
     if mode == "layout":
-        if not has_letter(text):
-            return None, "нет букв"
         out, direction = convert_layout(text)
         if out == text:
             return None, "нечего менять (%s)" % direction
