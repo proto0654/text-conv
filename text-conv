@@ -9,9 +9,10 @@
   --stdin  не трогать буфер обмена, читать текст из stdin и печатать результат
            (для отладки и тестов)
 
-Как работает без автодетекта: берём активное окно, кладём в буфер уникальную
-метку, жмём «копировать» (Ctrl+C, а в терминалах Ctrl+Shift+C), ждём, пока в
-буфере появится выделенный текст. Метка на месте = ничего не выделено.
+Как работает без автодетекта: запоминаем текущий буфер, жмём «копировать»
+(Ctrl+C, а в терминалах Ctrl+Shift+C) и ждём, пока содержимое буфера изменится —
+это и есть выделенный текст. Не изменилось = копирование не прошло: смотрим
+PRIMARY-выделение, затем пробуем выделить слово слева от курсора.
 Дальше кладём в буфер результат и жмём «вставить», после чего возвращаем
 прежнее содержимое буфера обмена.
 """
@@ -278,44 +279,59 @@ def main():
 
 
 def do_convert(mode):
+    t0 = time.time()
+    marks = []
+
+    def mark(name):
+        marks.append("%s=%.0f" % (name, (time.time() - t0) * 1000))
+
     klass = active_window()
     terminal = any(h in klass for h in TERMINAL_HINTS)
     log("mode=%s class=%r terminal=%s" % (mode, klass, terminal))
+    mark("win")
 
     original = read_clip() or b""
-    sentinel = ("__TEXT_CONV_%d__" % os.getpid()).encode()
-
-    # 1. помечаем буфер, чтобы отличить «ничего не выделено» от «текст совпал»,
-    #    и сразу копируем. Модификаторы хоткея отпускаются тем же вызовом wtype:
-    #    иначе при зажатом Shift Ctrl+C уходит как Ctrl+Shift+C (в Chrome это
-    #    «inspect element»)
-    if not set_clip(sentinel):
-        notify("Буфер обмена занят, попробуйте ещё раз")
-        return 0
-    send_chord("c", terminal=terminal, release_mods=True)
+    baseline = original  # с чем сравниваем буфер, чтобы понять «скопировалось»
 
     pasted = None
+    how = "?"
 
-    def grab(timeout_steps=25):
+    def grab(timeout_steps=15):
+        """Ждём, пока буфер перестанет быть прежним: значит приложение скопировало.
+
+        Раньше сюда писали метку `__TEXT_CONV_<pid>__` и ждали подтверждения
+        владения — это стоило лишний `wl-copy` (~75 мс, пока буфером владеет
+        чужое окно) и порождало гонку с записью. Сравнение с содержимым до
+        нажатия дешевле: если копирование не удалось, буфер не изменится.
+        """
         for _ in range(timeout_steps):
-            time.sleep(0.008)  # приложение отвечает на Ctrl+C за ~10-30 мс
+            time.sleep(0.008)
             got = read_clip()
             if DEBUG:
                 dbg("poll: %r" % (got[:40] if got else got,))
-            if got is not None and got != sentinel:
+            if got is not None and got != baseline:
                 return got
         return None
 
-    # 1) обычное копирование в буфер обмена
+    # 1. копируем. Модификаторы хоткея отпускаются тем же вызовом wtype: иначе
+    #    при зажатом Shift Ctrl+C уходит как Ctrl+Shift+C (в Chrome это
+    #    «inspect element»)
+    send_chord("c", terminal=terminal, release_mods=True)
+    mark("copy")
     pasted = grab()
+    mark("grab")
+    if pasted is not None:
+        how = "clip"
 
-    # 1b) вторая попытка: копирование могло не сработать с первого раза
+    # 1b) вторая попытка: аккорд мог не дойти (фокус, порядок событий)
     if pasted is None:
         dbg("retry copy")
-        time.sleep(0.15)
-        if set_clip(sentinel):
-            send_chord("c", terminal=terminal, release_mods=True)
-            pasted = grab()
+        time.sleep(0.05)
+        send_chord("c", terminal=terminal, release_mods=True)
+        pasted = grab()
+        mark("retry")
+        if pasted is not None:
+            how = "clip2"
 
     # 2) выделение мышью: Electron/Chromium отдаёт его в PRIMARY, а Ctrl+C иногда
     #    не срабатывает, поэтому читаем первичное выделение напрямую
@@ -324,19 +340,22 @@ def do_convert(mode):
         if prim:
             dbg("primary: %r" % (prim[:60],))
             pasted = prim
+            how = "primary"
+        mark("prim")
 
     # 3) ничего не выделено — берём слово слева от курсора
     if pasted is None and not terminal:
         dbg("no selection, selecting word to the left")
         select_word_left()
-        time.sleep(0.12)
-        if set_clip(sentinel):
-            send_chord("c", terminal=terminal)
-            pasted = grab()
+        time.sleep(0.05)
+        send_chord("c", terminal=terminal)
+        pasted = grab()
+        mark("word")
+        if pasted is not None:
+            how = "word"
 
     if pasted is None:
-        write_clip(original)
-        log("no selection (sentinel intact)")
+        log("no selection (clipboard unchanged) | %s" % " ".join(marks))
         notify("Ничего не выделено")
         return 0
 
@@ -350,26 +369,52 @@ def do_convert(mode):
     out, why = transform(text, mode)
     if out is None:
         write_clip(original)
-        log("noop: %s | text=%r" % (why, text[:60]))
+        log("noop: %s | text=%r | %s" % (why, text[:60], " ".join(marks)))
         notify(why)
         return 0
 
-    if not set_clip(out):
-        notify("Не удалось записать буфер обмена")
-        return 0
+    if not set_clip(out, timeout=0.5):
+        dbg("rewrite clipboard")  # соседний wl-copy мог перехватить владение
+        if not set_clip(out):
+            notify("Не удалось записать буфер обмена")
+            return 0
+    mark("sent2")
     send_chord("v", terminal=terminal)
-    log("ok %s: %r -> %r" % (why, text[:60], out[:60]))
+    mark("paste")
 
     # раскладку системы ставим на тот язык, в который сконвертировали
     if mode == "layout":
         switch_keyboard_layout(why)
+        mark("layout")
 
-    # возвращаем прежний буфер чуть позже, чтобы вставка успела прочитать
-    backup = "/tmp/text-conv-restore-%d" % os.getpid()
-    with open(backup, "wb") as f:
+    log(
+        "ok %s: %r -> %r | %.0f ms via=%s | %s"
+        % (why, text[:60], out[:60], (time.time() - t0) * 1000, how, " ".join(marks))
+    )
+
+    # возвращаем прежний буфер чуть позже, чтобы вставка успела прочитать.
+    # Только если в буфере всё ещё наш результат: иначе затрём то, что
+    # пользователь скопировал сам, или буфер следующего запуска (гонка
+    # восстановления с быстрым повторным нажатием давала «клип не подтверждён»)
+    pid = os.getpid()
+    old_file = "/tmp/text-conv-restore-%d.old" % pid
+    new_file = "/tmp/text-conv-restore-%d.new" % pid
+    cur_file = "/tmp/text-conv-restore-%d.cur" % pid
+    with open(old_file, "wb") as f:
         f.write(original)
+    with open(new_file, "wb") as f:
+        f.write(out.encode("utf-8"))
     subprocess.Popen(
-        ["sh", "-c", 'sleep 1.5; wl-copy < "$1"; rm -f "$1"', "sh", backup],
+        [
+            "sh",
+            "-c",
+            'sleep 1.5; wl-paste -n > "$3"; cmp -s "$3" "$2" && wl-copy < "$1";'
+            ' rm -f "$1" "$2" "$3"',
+            "sh",
+            old_file,
+            new_file,
+            cur_file,
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
