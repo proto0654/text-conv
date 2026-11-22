@@ -55,6 +55,17 @@ EN_RU, RU_EN = _tables()
 # "".join(dict.get(c, c) for c in text) и без лямбд, как в re.sub
 TRANS = {"en->ru": str.maketrans(EN_RU), "ru->en": str.maketrans(RU_EN)}
 
+# Браузеры и Electron-приложения под XWayland: Ctrl+C при физически зажатом
+# Shift уходит как Ctrl+Shift+C — Chrome открывает «Inspect element» (DevTools),
+# VS Code — внешний терминал. В таких окнах сначала берём PRIMARY-выделение без
+# инъекции, а «копировать» жмём только после паузы, за которую Shift успевает
+# отпуститься. Пауза платится лишь в браузерах, остальные окна не тормозятся.
+BROWSER_HINTS = (
+    "chrome", "chromium", "brave", "vivaldi", "opera", "edge",
+    "electron", "code", "cursor", "slack", "discord",
+)
+BROWSER_MOD_DELAY = 0.15
+
 TERMINAL_HINTS = (
     "alacritty", "foot", "kitty", "ghostty", "wezterm",
     "konsole", "xterm", "urxvt", "tilix", "term",
@@ -313,15 +324,29 @@ def do_convert(mode):
                 return got
         return None
 
-    # 1. копируем. Модификаторы хоткея отпускаются тем же вызовом wtype: иначе
-    #    при зажатом Shift Ctrl+C уходит как Ctrl+Shift+C (в Chrome это
-    #    «inspect element»)
-    send_chord("c", terminal=terminal, release_mods=True)
-    mark("copy")
-    pasted = grab()
-    mark("grab")
-    if pasted is not None:
-        how = "clip"
+    # 0. В браузерах и Electron сначала PRIMARY-выделение: инъекция не нужна,
+    #    значит и Ctrl+Shift+C с открытием DevTools случиться не может.
+    browser = any(hint in klass for hint in BROWSER_HINTS)
+    if browser:
+        prim = read_primary()
+        if prim:
+            pasted = prim
+            how = "primary"
+            mark("prim")
+
+    # 1. копируем. Модификаторы хоткея отпускаются тем же вызовом wtype, но
+    #    физический Shift этим не снимается: пока он зажат, Ctrl+C уходит как
+    #    Ctrl+Shift+C (в Chrome это «inspect element»). Поэтому в браузерах
+    #    сначала ждём, чтобы Shift отпустили, и только потом жмём.
+    if pasted is None:
+        if browser:
+            time.sleep(BROWSER_MOD_DELAY)
+        send_chord("c", terminal=terminal, release_mods=True)
+        mark("copy")
+        pasted = grab()
+        mark("grab")
+        if pasted is not None:
+            how = "clip"
 
     # 1b) вторая попытка: аккорд мог не дойти (фокус, порядок событий)
     if pasted is None:
