@@ -6,7 +6,7 @@
 
 ```
 ghbdtn? rfr ltkf/   →  Shift+Pause  →  привет, как дела.
-ПРИВЕТ мир          →  Alt+Pause    →  привет МИР
+ПРИВЕТ мир          →  Ctrl+Pause   →  привет МИР
 ```
 
 ## Возможности
@@ -60,8 +60,8 @@ cd text-conv
 ```lua
 o.bind("SHIFT + PAUSE", "Сменить раскладку выделенного", "/home/<you>/.local/bin/text-conv layout", { release = true })
 o.bind("SHIFT + BREAK", "Сменить раскладку выделенного", "/home/<you>/.local/bin/text-conv layout", { release = true })
-o.bind("ALT + PAUSE", "Инвертировать регистр выделенного", "/home/<you>/.local/bin/text-conv case", { release = true })
-o.bind("ALT + BREAK", "Инвертировать регистр выделенного", "/home/<you>/.local/bin/text-conv case", { release = true })
+o.bind("CTRL + PAUSE", "Инвертировать регистр выделенного", "/home/<you>/.local/bin/text-conv case", { release = true })
+o.bind("CTRL + BREAK", "Инвертировать регистр выделенного", "/home/<you>/.local/bin/text-conv case", { release = true })
 ```
 
 Классический `hyprland.conf` (не Omarchy-обвязка, а обычный Hyprland — без Lua):
@@ -69,8 +69,8 @@ o.bind("ALT + BREAK", "Инвертировать регистр выделен�
 ```ini
 bindr = SHIFT, Pause, exec, /home/<you>/.local/bin/text-conv layout
 bindr = SHIFT, Break, exec, /home/<you>/.local/bin/text-conv layout
-bindr = ALT,   Pause, exec, /home/<you>/.local/bin/text-conv case
-bindr = ALT,   Break, exec, /home/<you>/.local/bin/text-conv case
+bindr = CTRL,  Pause, exec, /home/<you>/.local/bin/text-conv case
+bindr = CTRL,  Break, exec, /home/<you>/.local/bin/text-conv case
 ```
 
 Почему дублируется `PAUSE` и `BREAK`: в XKB клавиша `<PAUS>` объявлена как
@@ -87,6 +87,13 @@ keysym `Break`, и биндинг только на `PAUSE` не сработа�
   одно нажатие проходят **оба** биндинга — раскладка и регистр затирают друг
   друга, и видно то «смену регистра вместо раскладки», то «капслок». С точными
   модификаторами на нажатие срабатывает ровно один биндинг.
+- регистр висит на **Ctrl**, а не на Alt, потому что модификатор хоткея физически
+  зажат, пока идёт вставка: `Ctrl+V` доезжает до приложения как `Ctrl+Alt+V`, а
+  это уже чужой шорткат (в Hermes — голосовой чат «Скажите stop…», в редакторах —
+  «вставить без форматирования»). Ctrl в `Ctrl+V` уже есть, поэтому его «утечка»
+  ничего не меняет. С Shift та же логика: у `Shift+Pause` вставка уходит как
+  `Ctrl+Shift+V` (вставка простым текстом), а копирование в Chrome/Chromium —
+  как `Ctrl+Shift+C`, поэтому для браузеров свитчер сначала берёт PRIMARY.
 
 После правки: `hyprctl reload && hyprctl configerrors`.
 
@@ -94,7 +101,7 @@ keysym `Break`, и биндинг только на `PAUSE` не сработа�
 
 1. Выделите текст мышью (или `Ctrl+A`, `Shift+стрелки`) — либо просто поставьте
    курсор после слова, тогда скрипт возьмёт слово слева.
-2. `Shift+Pause` — сменить раскладку, `Alt+Pause` — инвертировать регистр.
+2. `Shift+Pause` — сменить раскладку, `Ctrl+Pause` — инвертировать регистр.
 
 ## Как это работает
 
