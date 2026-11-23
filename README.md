@@ -1,8 +1,8 @@
 # text-conv
 
-Правка **уже выделенного** текста по хоткею в Hyprland/Wayland: смена раскладки
-(латиница ⇄ кириллица) и инверсия регистра. Без автопереключения и без
-фонового демона — только два биндинга и скрипт.
+Правка **уже выделенного** текста по хоткею в Hyprland/Wayland: ровно две
+операции-переключателя — раскладка (латиница ⇄ кириллица) и регистр. Без
+автопереключения и без фонового демона — только два биндинга и скрипт.
 
 ```
 ghbdtn? rfr ltkf/   →  Shift+Pause  →  привет, как дела.
@@ -11,6 +11,8 @@ ghbdtn? rfr ltkf/   →  Shift+Pause  →  привет, как дела.
 
 ## Возможности
 
+- **Операций всего две**: `layout` и `case`. Каждая — тогл: повторное нажатие
+  возвращает текст символ в символ, третьих режимов и «умных» вариантов нет.
 - **Смена раскладки** (`layout`): `en→ru` или `ru→en` — направление выбирается по
   преобладающим буквам, так что одна клавиша работает в обе стороны.
 - **Инверсия регистра** (`case`): посимвольная, `Привет` → `пРИВЕТ`.
@@ -56,24 +58,35 @@ cd text-conv
 Затем добавьте биндинги в `~/.config/hypr/bindings.lua` (Omarchy/Hyprland Lua-конфиг):
 
 ```lua
-o.bind("SHIFT + PAUSE", "Сменить раскладку выделенного", "/home/<you>/.local/bin/text-conv layout")
-o.bind("SHIFT + BREAK", "Сменить раскладку выделенного", "/home/<you>/.local/bin/text-conv layout")
-o.bind("ALT + PAUSE", "Инвертировать регистр выделенного", "/home/<you>/.local/bin/text-conv case")
-o.bind("ALT + BREAK", "Инвертировать регистр выделенного", "/home/<you>/.local/bin/text-conv case")
+o.bind("SHIFT + PAUSE", "Сменить раскладку выделенного", "/home/<you>/.local/bin/text-conv layout", { release = true })
+o.bind("SHIFT + BREAK", "Сменить раскладку выделенного", "/home/<you>/.local/bin/text-conv layout", { release = true })
+o.bind("ALT + PAUSE", "Инвертировать регистр выделенного", "/home/<you>/.local/bin/text-conv case", { release = true })
+o.bind("ALT + BREAK", "Инвертировать регистр выделенного", "/home/<you>/.local/bin/text-conv case", { release = true })
 ```
 
 Классический `hyprland.conf` (не Omarchy-обвязка, а обычный Hyprland — без Lua):
 
 ```ini
-bind = SHIFT, Pause, exec, /home/<you>/.local/bin/text-conv layout
-bind = SHIFT, Break, exec, /home/<you>/.local/bin/text-conv layout
-bind = ALT,   Pause, exec, /home/<you>/.local/bin/text-conv case
-bind = ALT,   Break, exec, /home/<you>/.local/bin/text-conv case
+bindr = SHIFT, Pause, exec, /home/<you>/.local/bin/text-conv layout
+bindr = SHIFT, Break, exec, /home/<you>/.local/bin/text-conv layout
+bindr = ALT,   Pause, exec, /home/<you>/.local/bin/text-conv case
+bindr = ALT,   Break, exec, /home/<you>/.local/bin/text-conv case
 ```
 
 Почему дублируется `PAUSE` и `BREAK`: в XKB клавиша `<PAUS>` объявлена как
 `[ Pause, Break ]` с `PC_CONTROL_LEVEL2`, то есть с зажатым Shift она отдаёт
 keysym `Break`, и биндинг только на `PAUSE` не сработает.
+
+Почему на отпускание и почему **без** `ignore_mods`:
+
+- нажатие обрабатывается на отпускании клавиши, потому что свитчер копирует
+  выделение инъекцией `Ctrl+C`, а пока Shift зажат физически, Chrome/Chromium
+  получает `Ctrl+Shift+C` = «Inspect element». На отпускании модификатор уже снят;
+- `ignore_mods` заставил бы Hyprland вообще не сверять модификаторы
+  (`KeybindManager.cpp`: `modmask != k->modmask && !k->ignoreMods`), и тогда на
+  одно нажатие проходят **оба** биндинга — раскладка и регистр затирают друг
+  друга, и видно то «смену регистра вместо раскладки», то «капслок». С точными
+  модификаторами на нажатие срабатывает ровно один биндинг.
 
 После правки: `hyprctl reload && hyprctl configerrors`.
 

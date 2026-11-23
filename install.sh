@@ -24,12 +24,13 @@ esac
 
 cat <<EOF
 
-Добавьте в ~/.config/hypr/bindings.lua:
+Добавьте в ~/.config/hypr/bindings.lua (release = true, без ignore_mods —
+иначе на одно нажатие сработают оба биндинга):
 
-  o.bind("SHIFT + PAUSE", "Сменить раскладку выделенного", "$target/text-conv layout")
-  o.bind("SHIFT + BREAK", "Сменить раскладку выделенного", "$target/text-conv layout")
-  o.bind("ALT + PAUSE", "Инвертировать регистр выделенного", "$target/text-conv case")
-  o.bind("ALT + BREAK", "Инвертировать регистр выделенного", "$target/text-conv case")
+  o.bind("SHIFT + PAUSE", "Сменить раскладку выделенного", "$target/text-conv layout", { release = true })
+  o.bind("SHIFT + BREAK", "Сменить раскладку выделенного", "$target/text-conv layout", { release = true })
+  o.bind("ALT + PAUSE", "Инвертировать регистр выделенного", "$target/text-conv case", { release = true })
+  o.bind("ALT + BREAK", "Инвертировать регистр выделенного", "$target/text-conv case", { release = true })
 
 Затем: hyprctl reload && hyprctl configerrors
 EOF
